@@ -26,18 +26,12 @@ pub fn run(
     'bed: while let Some(q) = reader.records().next() {
         let mut q = q.unwrap();
         while let Some(Ok(t)) = trg {
-            // immediately setting new value for `trg` to avoid ownership issues
-            println!("Checking query {:?} and target {:?} for overlap", &q, &t);
             if *t.end() >= q.start() {
-                println!("Target is at or after query, checking for overlap");
                 if overlap(&q, &t) {
-                    println!("Overlap!");
                     if let Some(gene) = t.attributes().get("gene_name") {
-                        println!("Setting gene!");
                         q.set_name(gene);
                     }
                 } else {
-                    println!("No overlap");
                     q.set_name(".");
                 }
                 trg = Some(Ok(t));
@@ -45,7 +39,6 @@ pub fn run(
             }
             trg = reference.records().next();
         }
-        println!("After annotation: {:?}", &q);
         writer.write(&q)?;
         continue 'bed;  // continue to next region
     }
