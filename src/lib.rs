@@ -29,10 +29,6 @@ impl fmt::Display for Interval {
     }
 }
 
-// fn overlapping(q: &(u64, u64), t: &(u64, u64)) -> bool {
-//     return t.0 <= q.0 && q.0 < t.1 || q.0 <= t.0 && t.0 <= q.1;
-// }
-
 fn find_annotations<'a>(
     queries: &SortedList<Interval, ()>,
     targets: &'a SortedList<Interval, gff::Record>,
@@ -156,13 +152,6 @@ pub fn run(
     writer: impl io::Write,
     gff_type: gff::GffType,
 ) -> anyhow::Result<()> {
-    // Assume regions are split by contig.
-    // Collect all regions for next contig. Check that no regions from previously met contigs are found, throw error otherwise.
-    // Once one contig collected, process it and print out:
-    //   Sort BED regions
-    //   If GTF is gzipped (otherwise use a different format?), for each region, just tabix the GTF file and get all overlapping regions.
-    //   If GTF is plain text or not indexed, assume that it's sorted at least. Iterate until same contig is found, then loop over GTF and BED in parallel
-
     let mut qreader = bed::Reader::new(qreader);
     let mut treader = gff::Reader::new(treader, gff_type);
     let mut writer = bed::Writer::new(writer);
@@ -179,13 +168,13 @@ pub fn run(
 
     let mut seen_qry_contigs: HashSet<String> = HashSet::new();
     let mut next_qry_contig = "".to_string();
-    // Collecting this hashmap until meeting the contig we are looking for:
+    // Buffering into this HashMap until we meet the contig we are looking for:
     let mut targets_buffer: HashMap<String, SortedList<Interval, gff::Record>> = HashMap::new();
-    // Buffering one last BED and GTF record so we do 2 parallel loops over BED and GTF
+    // Buffering one last BED and GTF record so we can do 2 parallel loops over BED and GTF:
     let mut buf_qry = None;
     let mut buf_trg = None;
     loop {
-        // contigs loop
+        // Contigs loop
         let mut cur_contig = next_qry_contig.clone();
         let mut cur_queries: SortedList<Interval, ()> = SortedList::new();
 
@@ -198,7 +187,7 @@ pub fn run(
                 let interval = Interval::new(rec.start(), rec.end());
                 cur_queries.insert(interval, ());
             } else {
-                // new contig
+                // New contig
                 if seen_qry_contigs.contains(rec.chrom()) {
                     return Err(anyhow::anyhow!(
                         "Parsing BED record {i}: contig {} is out of order",
@@ -233,7 +222,7 @@ pub fn run(
                 }
                 let interval = Interval::new(*rec.start() - 1, *rec.end());
                 if rec.seqname() != &cur_contig {
-                    // buffering
+                    // Buffering
                     targets_buffer
                         .entry(rec.seqname().to_owned())
                         .or_insert(SortedList::new())
