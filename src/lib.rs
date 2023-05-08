@@ -107,7 +107,6 @@ fn resolve_all_overlaps<'a>(
         .keys()
         .enumerate()
         .map(|(i, q)| {
-            eprintln!("Unsorted annotations for {i}: {:?}", annotations[i]);
             annotations[i].sort_by_key(|t| {
                 // chr1    HAVANA  exon    12010   12057   .       +       .       gene_id "ENSG00000223972.6"; transcript_id "ENST00000450305.2"; gene_type "transcribed_unprocessed_pseudogene"; gene_name "DDX11L1"; transcript_type "transcribed_unprocessed_pseudogene"; transcript_name "DDX11L1-201"; exon_number 1; exon_id "ENSE00001948541.1"; level 2; transcript_support_level "NA"; hgnc_id "HGNC:37102"; ont "PGO:0000005"; ont "PGO:0000019"; tag "basic"; tag "Ensembl_canonical"; havana_gene "OTTHUMG00000000961.2"; havana_transcript "OTTHUMT00000002844.2";
                 let feature_type = feature_type_map
@@ -140,7 +139,6 @@ fn resolve_all_overlaps<'a>(
                 };
                 (feature_type, mane, tsl, level, coding, overlap)
             });
-            eprintln!("Sorted annotations for {i}: {:?}", annotations[i]);
             annotations[i].first().map(|x| *x)
         })
         .collect()
