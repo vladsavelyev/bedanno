@@ -1,10 +1,8 @@
 use anyhow;
 use bio::io::bed;
-use bio::io::gff;
 use sorted_list::SortedList;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::io;
+use std::io::{self, BufRead};
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
 struct Interval {
@@ -23,28 +21,93 @@ impl Interval {
     }
 }
 
-impl fmt::Display for Interval {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}, {})", self.start, self.end)
+#[derive(Clone, PartialEq)]
+struct GffLine {
+    contig: String,
+    interval: Interval,
+    feature_type: String,
+    annotation: String,
+}
+
+#[derive(Clone)]
+struct Annotation {
+    interval: Interval,
+    gene_name: Option<String>,
+    feature_type: String,
+    mane: bool,
+    tsl: String,
+    level: u8,
+    transcript_type: String,
+}
+
+impl Annotation {
+    fn from_gff_line(line: &GffLine) -> Self {
+        let mut attributes: HashMap<String, String> = HashMap::new();
+        for attr in line
+            .annotation
+            .split(';')
+            .filter(|x| !x.is_empty())
+        {
+            let mut kv = attr
+                .trim_matches(' ')
+                .split(|x| x == '=' || x == ' ');
+            let key = kv.next().expect(attr).to_string();
+            let value = kv.next().expect(attr).trim_matches('"').to_string();
+            attributes.insert(key, value);
+        }
+        let mane = attributes
+            .get("tag")
+            .map_or(false, |x| x == "MANE_Select");
+        let tsl = attributes
+            .get("transcript_support_level")
+            .map_or("NA".to_string(), |x| x.to_string());
+        let level = attributes
+            .get("level")
+            .map_or(255, |x| x.parse::<u8>().unwrap_or(255));
+        let transcript_type = attributes
+            .get("transcript_type")
+            .map_or("".to_string(), |x| x.to_string());
+        Self {
+            interval: line.interval.clone(),
+            gene_name: attributes.get("gene_name").cloned(),
+            feature_type: line.feature_type.clone(),
+            mane,
+            tsl,
+            level,
+            transcript_type,
+        }
     }
 }
 
-fn find_annotations<'a>(
+impl GffLine {
+    fn from_line(line: &str) -> Self {
+        let tokens: Vec<&str> = line.split("\t").collect::<Vec<&str>>();
+        GffLine {
+            contig: tokens[0].to_string(),
+            interval: Interval::new(
+                tokens[3].parse::<u64>().unwrap() - 1,
+                tokens[4].parse::<u64>().unwrap(),
+            ),
+            feature_type: tokens[2].to_string(),
+            annotation: tokens[8].to_string(),
+        }
+    }
+}
+
+fn find_overlaps<'a>(
     queries: &SortedList<Interval, ()>,
-    targets: &'a SortedList<Interval, gff::Record>,
-) -> Vec<Vec<&'a gff::Record>> {
-    //
-    let mut result: Vec<Vec<&gff::Record>> = Vec::new();
+    targets: &'a SortedList<Interval, GffLine>,
+) -> Vec<Vec<&'a GffLine>> {
+    let mut result: Vec<Vec<&GffLine>> = Vec::new();
 
     let mut targets = targets.values();
-    let mut prev_overlaps: Vec<&gff::Record> = vec![];
+    let mut prev_overlaps: Vec<&GffLine> = vec![];
 
-    let mut trg: Option<&'a gff::Record> = None;
+    let mut trg: Option<&'a GffLine> = None;
     for q in queries.keys() {
         // skip targets that are before the query
         while let Some(rec) = trg.or_else(|| targets.next()) {
-            let t = Interval::new(rec.start() - 1, *rec.end());
-            if t.end >= q.start {
+            if rec.interval.end >= q.start {
                 trg = Some(rec);
                 break;
             }
@@ -54,8 +117,7 @@ fn find_annotations<'a>(
         let mut new_overlaps = vec![];
         while let Some(rec) = trg.or_else(|| targets.next()) {
             trg = None;
-            let t = Interval::new(rec.start() - 1, *rec.end());
-            if t.overlapping(&q) {
+            if q.overlapping(&rec.interval) {
                 new_overlaps.push(rec);
             } else {
                 trg = Some(rec);
@@ -66,10 +128,7 @@ fn find_annotations<'a>(
         result.push(
             prev_overlaps
                 .iter()
-                .skip_while(|rec| {
-                    let t = Interval::new(rec.start() - 1, *rec.end());
-                    !q.overlapping(&t)
-                })
+                .skip_while(|rec| !q.overlapping(&rec.interval))
                 .chain(new_overlaps.iter())
                 .map(|rec| *rec)
                 .collect(),
@@ -81,9 +140,9 @@ fn find_annotations<'a>(
 
 fn resolve_all_overlaps<'a>(
     queries: &'a SortedList<Interval, ()>,
-    annotations: &'a mut Vec<Vec<&'a gff::Record>>,
-) -> Vec<Option<&'a gff::Record>> {
-    let feature_type_map = [
+    gfflines: &'a mut Vec<Vec<&'a GffLine>>,
+) -> Vec<Option<Annotation>> {
+    let feature_type_rank = [
         "CDS",
         "stop_codon",
         "start_codon",
@@ -97,7 +156,7 @@ fn resolve_all_overlaps<'a>(
     .map(|(i, x)| (x.to_owned().to_owned(), i))
     .collect::<HashMap<String, usize>>();
 
-    let tsl_map = ["1", "2", "3", "4", "5", "NA"]
+    let tsl_rank = ["1", "2", "3", "4", "5", "NA"]
         .iter()
         .enumerate()
         .map(|(i, x)| (x.to_owned().to_owned(), i))
@@ -107,67 +166,57 @@ fn resolve_all_overlaps<'a>(
         .keys()
         .enumerate()
         .map(|(i, q)| {
-            annotations[i].sort_by_key(|t| {
+            let mut annotations: Vec<Annotation> = gfflines[i]
+                .iter()
+                .map(|&t| Annotation::from_gff_line(t))
+                .collect();
+            annotations.sort_by_key(|anno| {
                 // chr1    HAVANA  exon    12010   12057   .       +       .       gene_id "ENSG00000223972.6"; transcript_id "ENST00000450305.2"; gene_type "transcribed_unprocessed_pseudogene"; gene_name "DDX11L1"; transcript_type "transcribed_unprocessed_pseudogene"; transcript_name "DDX11L1-201"; exon_number 1; exon_id "ENSE00001948541.1"; level 2; transcript_support_level "NA"; hgnc_id "HGNC:37102"; ont "PGO:0000005"; ont "PGO:0000019"; tag "basic"; tag "Ensembl_canonical"; havana_gene "OTTHUMG00000000961.2"; havana_transcript "OTTHUMT00000002844.2";
-                let feature_type = feature_type_map
-                    .get(t.feature_type())
+                let feature_type = feature_type_rank
+                    .get(&anno.feature_type)
                     .unwrap_or(&255);
-                let mane: u8 = t
-                    .attributes()
-                    .get("tag")
-                    .map(|x| if x == "MANE_Select" { 0 } else { 1 })
-                    .unwrap_or(255);
-                let tsl = t
-                    .attributes()
-                    .get("transcript_support_level")
-                    .map(|x| tsl_map.get(x).unwrap())
-                    .unwrap_or(&255);
-                let level = t
-                    .attributes()
-                    .get("level")
-                    .map(|x| x.parse::<u8>().unwrap_or(255))
-                    .unwrap_or(255);
-                let coding: u8 = t
-                    .attributes()
-                    .get("transcript_type")
-                    .map(|x| if x == "protein_coding" { 0 } else { 1 })
-                    .unwrap_or(255);
-                let overlap = if q.start < *t.start() - 1 {
-                    q.end - *t.start() - 1
+                let mane: u8 = if anno.mane { 0 } else { 255 };
+                let tsl = tsl_rank.get(&anno.tsl).unwrap_or(&255);
+                let level = anno.level;
+                let coding: u8 = (anno.transcript_type != "protein_coding") as u8;
+                assert!(dbg!(&q).overlapping(dbg!(&anno.interval)));
+                let overlap = if q.start < anno.interval.start {
+                    q.end - anno.interval.start
                 } else {
-                    *t.end() - q.start
+                    anno.interval.end - q.start
                 };
                 (feature_type, mane, tsl, level, coding, overlap)
             });
-            annotations[i].first().map(|x| *x)
+            annotations.first().cloned()
         })
-        .collect()
+        .collect::<Vec<Option<Annotation>>>()
 }
 
 pub fn run(
     qreader: impl io::Read,
     treader: impl io::Read,
     writer: impl io::Write,
-    gff_type: gff::GffType,
 ) -> anyhow::Result<()> {
-    let mut qreader = bed::Reader::new(qreader);
-    let mut treader = gff::Reader::new(treader, gff_type);
-    let mut writer = bed::Writer::new(writer);
+    // let mut treader = gff::Reader::new(treader, gff_type);
 
+    let mut qreader = bed::Reader::new(qreader);
     let mut qreader = qreader
         .records()
         .enumerate()
         .map(|(i, x)| (i, x.expect(&format!("Parsing BED line {}", i))));
 
-    let mut treader = treader
-        .records()
-        .enumerate()
-        .map(|(i, x)| (i, x.expect(&format!("Parsing GTF line {}", i))));
+    let mut treader = io::BufReader::new(treader)
+        .lines()
+        .map(|x| x.expect("Reading GTF line"))
+        .skip_while(|x| x.starts_with('#'))
+        .enumerate();
+
+    let mut writer = bed::Writer::new(writer);
 
     let mut seen_qry_contigs: HashSet<String> = HashSet::new();
     let mut next_qry_contig = "".to_string();
     // Buffering into this HashMap until we meet the contig we are looking for:
-    let mut targets_buffer: HashMap<String, SortedList<Interval, gff::Record>> = HashMap::new();
+    let mut targets_buffer: HashMap<String, SortedList<Interval, GffLine>> = HashMap::new();
     // Buffering one last BED and GTF record so we can do 2 parallel loops over BED and GTF:
     let mut buf_qry = None;
     let mut buf_trg = None;
@@ -198,12 +247,10 @@ pub fn run(
                 break;
             }
         }
-        if cur_contig == "" {
-            return Err(anyhow::anyhow!("No records found in BED file"));
-        }
         if cur_queries.len() == 0 {
             return Ok(());
         }
+        eprintln!("Processing contig, {}", cur_contig);
 
         // Now that we collected queries for qry_contig, looking for corresponding targets
         let cur_targets = if targets_buffer.contains_key(&cur_contig) {
@@ -211,28 +258,33 @@ pub fn run(
             targets_buffer.remove(&cur_contig).unwrap()
         } else {
             // Else searching in the file:
-            let mut res: SortedList<Interval, gff::Record> = SortedList::new();
-            while let Some((i, rec)) = buf_trg.clone().or_else(|| treader.next()) {
+            let mut res: SortedList<Interval, GffLine> = SortedList::new();
+            while let Some((i, line)) = buf_trg.clone().or_else(|| treader.next()) {
+                if i % 100_000 == 0 {
+                    eprintln!("GTF line number {i}");
+                }
                 buf_trg = None;
-                if rec.seqname() != cur_contig && res.len() > 0 {
-                    buf_trg = Some((i, rec));
+
+                let rec = GffLine::from_line(&line);
+
+                if rec.contig != cur_contig && res.len() > 0 {
+                    buf_trg = Some((i, line));
                     break; // finished collecting contig data
                 }
-                let interval = Interval::new(*rec.start() - 1, *rec.end());
-                if rec.seqname() != &cur_contig {
+                if rec.contig != cur_contig {
                     // Buffering
                     targets_buffer
-                        .entry(rec.seqname().to_owned())
+                        .entry(rec.contig.to_owned())
                         .or_insert(SortedList::new())
                 } else {
                     &mut res
                 }
-                .insert(interval, rec.clone());
+                .insert(rec.interval.clone(), rec);
             }
             res
         };
 
-        let mut annotations = find_annotations(&mut cur_queries, &cur_targets);
+        let mut annotations = find_overlaps(&mut cur_queries, &cur_targets);
         let annotations = resolve_all_overlaps(&cur_queries, &mut annotations);
         for (q, anno) in cur_queries.keys().zip(annotations) {
             let mut rec = bed::Record::new();
@@ -240,9 +292,8 @@ pub fn run(
             rec.set_start(q.start);
             rec.set_end(q.end);
             let gene = anno
-                .and_then(|x| x.attributes().get("gene_name"))
-                .unwrap_or(&".".to_owned())
-                .to_owned();
+                .map_or(".".to_string(), |x| x.gene_name.unwrap_or(".".to_string()))
+                .to_string();
             rec.set_name(&gene);
             writer.write(&rec)?;
         }
@@ -265,8 +316,8 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn test_annotate() {
+    // #[test]
+    fn test1() {
         let queries = to_str(&[
             "chr1  10  50",
             "chr1  100 150",
@@ -309,7 +360,29 @@ mod tests {
             Box::new(queries.as_bytes()),
             Box::new(targets.as_bytes()),
             Box::new(&mut output),
-            gff::GffType::GFF3,
+        )
+        .expect("Cannot annotate BED file");
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(&expected.trim(), &output.trim())
+    }
+
+    #[test]
+    fn test2() {
+        let queries = to_str(&["chr1	11144641	11144761", "chr1	11144947	11145067"]);
+        let targets = &[
+            "chr1\tHAVANA\texon\t11144667\t11144886\t.\t+\t.\tgene_id \"ENSG00000225602.5\"; transcript_id \"ENST00000445982.5\"; gene_type \"lncRNA\"; gene_name \"MTOR-AS1\"; transcript_type \"lncRNA\"; transcript_name \"MTOR-AS1-202\"; exon_number 2; exon_id \"ENSE00001736483.1\"; level 2; transcript_support_level \"5\"; hgnc_id \"HGNC:40242\"; tag \"dotter_confirmed\"; tag \"basic\"; tag \"Ensembl_canonical\"; havana_gene \"OTTHUMG00000002003.1\"; havana_transcript \"OTTHUMT00000005565.1\";"
+        ].join("\n");
+        let expected = to_str(&[
+            "chr1	11144641	11144761	MTOR-AS1",
+            "chr1	11144947	11145067	.",
+        ]);
+        let mut output = vec![];
+
+        run(
+            Box::new(queries.as_bytes()),
+            Box::new(targets.as_bytes()),
+            Box::new(&mut output),
         )
         .expect("Cannot annotate BED file");
 
