@@ -32,7 +32,21 @@ chrX   100  200  KEEPX
 chrM   0    200  .
 ```
 
-Works fastest when chromosomes are sorted and in the same order between BED and GTF, however doesn't require it.
+When there are multiple genes overlapping a region, the gene with the highest priority will be used. The priority is
+defined as follows:
+
+1. Feature type (`CDS` > `stop_codon` > `start_codon` > `UTR` > `exon` > `transcript` > `gene` > everything else)
+2. Whether the annotation is selected in `MANE` as the primary transcript.
+3. Transcript support level (`1` (all splice junctions are supported by at least one non-suspect mRNA) > `2` (best
+   supporting mRNA is flagged as suspect or the support is from multiple ESTs) > `3` (only support is from a single
+   EST) > `4` (best supporting EST is flagged as suspect) > `5` (no single transcript supports the model
+   structure) > `NA` (transcript that was not analysed for TSL).
+4. Confidence level (`1` (feature is validated) > `2` (manual annotation) > `3` (automated annotation)
+5. Whether transcript type is `protein_coding`.
+6. Overlap % between GTF and BED region.
+
+The tool works fastest when chromosomes are sorted and in the same order between BED and GTF, however doesn't require
+it.
 
 Regions within chromosomes also don't need to be sorted, however the tool would benefit if they are.
 
