@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use bedanno;
 use flate2::read::GzDecoder;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io;
 
 fn main() {
     let mut args = env::args();
@@ -48,39 +47,4 @@ fn main() {
     let output = io::stdout();
 
     bedanno::run(query, target, output).expect("Should be able to annotate BED file")
-
-    // proc(target);
-}
-
-fn proc(target: Box<dyn io::Read>) {
-    // let mut target = target
-    //     .enumerate()
-    //     .map(|(i, x)| (i, x.expect(&format!("Parsing GFF line {}", i))));
-    let mut now = std::time::Instant::now();
-    let mut i = 0;
-    let mut target = BufReader::new(target);
-    // let mut target = gff::Reader::new(target, gff_type);
-
-    for (i, rec) in target
-        .lines()
-        .map(|x| x.unwrap())
-        .filter(|x| !x.starts_with("#"))
-        .enumerate()
-    {
-        let tokens: Vec<&str> = rec.split("\t").collect::<Vec<&str>>();
-        let chrom = tokens[0];
-        let gene_type = tokens[2];
-        let start = tokens[3].parse::<u64>().unwrap();
-        let end = tokens[4].parse::<u64>().unwrap();
-        if i % 100_000 == 0 {
-            eprintln!("{i} records processed, current chrom {chrom}");
-            let elapsed = now.elapsed();
-            eprintln!(
-                "{}.{:03} seconds elapsed",
-                elapsed.as_secs(),
-                elapsed.subsec_millis()
-            );
-            now = std::time::Instant::now();
-        }
-    }
 }

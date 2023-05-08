@@ -1,8 +1,7 @@
 use anyhow;
-use bio::io::bed;
 use sorted_list::SortedList;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
 struct Interval {
@@ -52,7 +51,11 @@ impl Annotation {
                 .trim_matches(' ')
                 .split(|x| x == '=' || x == ' ');
             let key = kv.next().expect(attr).to_string();
-            let value = kv.next().expect(attr).trim_matches('"').to_string();
+            let value = kv
+                .next()
+                .expect(attr)
+                .trim_matches('"')
+                .to_string();
             attributes.insert(key, value);
         }
         let mane = attributes
@@ -81,7 +84,7 @@ impl Annotation {
 
 impl GffLine {
     fn from_line(line: &str) -> Self {
-        let tokens: Vec<&str> = line.split("\t").collect::<Vec<&str>>();
+        let tokens: Vec<&str> = line.split('\t').collect::<Vec<&str>>();
         GffLine {
             contig: tokens[0].to_string(),
             interval: Interval::new(
@@ -128,7 +131,7 @@ fn find_overlaps<'a>(
         result.push(
             prev_overlaps
                 .iter()
-                .skip_while(|rec| !q.overlapping(&rec.interval))
+                .filter(|rec| q.overlapping(&rec.interval))
                 .chain(new_overlaps.iter())
                 .map(|rec| *rec)
                 .collect(),
@@ -179,7 +182,6 @@ fn resolve_all_overlaps<'a>(
                 let tsl = tsl_rank.get(&anno.tsl).unwrap_or(&255);
                 let level = anno.level;
                 let coding: u8 = (anno.transcript_type != "protein_coding") as u8;
-                assert!(dbg!(&q).overlapping(dbg!(&anno.interval)));
                 let overlap = if q.start < anno.interval.start {
                     q.end - anno.interval.start
                 } else {
@@ -199,19 +201,19 @@ pub fn run(
 ) -> anyhow::Result<()> {
     // let mut treader = gff::Reader::new(treader, gff_type);
 
-    let mut qreader = bed::Reader::new(qreader);
-    let mut qreader = qreader
-        .records()
+    let mut qreader = io::BufReader::new(qreader)
+        .lines()
         .enumerate()
-        .map(|(i, x)| (i, x.expect(&format!("Parsing BED line {}", i))));
+        .map(|(i, x)| (i, x.expect(&format!("Reading BED line {i}"))))
+        .skip_while(|(_, x)| x.starts_with('#'));
 
     let mut treader = io::BufReader::new(treader)
         .lines()
-        .map(|x| x.expect("Reading GTF line"))
-        .skip_while(|x| x.starts_with('#'))
-        .enumerate();
+        .enumerate()
+        .map(|(i, x)| (i, x.expect(&format!("Reading GTF line {i}"))))
+        .skip_while(|(_, x)| x.starts_with('#'));
 
-    let mut writer = bed::Writer::new(writer);
+    let mut writer = io::BufWriter::new(writer);
 
     let mut seen_qry_contigs: HashSet<String> = HashSet::new();
     let mut next_qry_contig = "".to_string();
@@ -225,25 +227,29 @@ pub fn run(
         let mut cur_contig = next_qry_contig.clone();
         let mut cur_queries: SortedList<Interval, ()> = SortedList::new();
 
-        while let Some((i, rec)) = buf_qry.clone().or_else(|| qreader.next()) {
+        while let Some((i, line)) = buf_qry.clone().or_else(|| qreader.next()) {
             buf_qry = None;
+            let tokens = line.split('\t').collect::<Vec<&str>>();
+            let contig = tokens[0];
             if cur_contig == "" {
-                cur_contig = rec.chrom().to_owned();
+                cur_contig = contig.to_string();
             }
-            if rec.chrom() == &cur_contig {
-                let interval = Interval::new(rec.start(), rec.end());
+            if contig == &cur_contig {
+                let start = tokens[1].parse::<u64>()?;
+                let end = tokens[2].parse::<u64>()?;
+                let interval = Interval::new(start, end);
                 cur_queries.insert(interval, ());
             } else {
                 // New contig
-                if seen_qry_contigs.contains(rec.chrom()) {
+                if seen_qry_contigs.contains(contig) {
                     return Err(anyhow::anyhow!(
                         "Parsing BED record {i}: contig {} is out of order",
-                        rec.chrom()
+                        contig
                     ));
                 }
                 seen_qry_contigs.insert(cur_contig.clone());
-                next_qry_contig = rec.chrom().to_owned();
-                buf_qry = Some((i, rec.clone()));
+                next_qry_contig = contig.to_owned();
+                buf_qry = Some((i, line.clone()));
                 break;
             }
         }
@@ -260,9 +266,6 @@ pub fn run(
             // Else searching in the file:
             let mut res: SortedList<Interval, GffLine> = SortedList::new();
             while let Some((i, line)) = buf_trg.clone().or_else(|| treader.next()) {
-                if i % 100_000 == 0 {
-                    eprintln!("GTF line number {i}");
-                }
                 buf_trg = None;
 
                 let rec = GffLine::from_line(&line);
@@ -287,15 +290,19 @@ pub fn run(
         let mut annotations = find_overlaps(&mut cur_queries, &cur_targets);
         let annotations = resolve_all_overlaps(&cur_queries, &mut annotations);
         for (q, anno) in cur_queries.keys().zip(annotations) {
-            let mut rec = bed::Record::new();
-            rec.set_chrom(&cur_contig);
-            rec.set_start(q.start);
-            rec.set_end(q.end);
+            let mut line = String::new();
+            line.push_str(&cur_contig);
+            line.push('\t');
+            line.push_str(&q.start.to_string());
+            line.push('\t');
+            line.push_str(&q.end.to_string());
             let gene = anno
                 .map_or(".".to_string(), |x| x.gene_name.unwrap_or(".".to_string()))
                 .to_string();
-            rec.set_name(&gene);
-            writer.write(&rec)?;
+            line.push('\t');
+            line.push_str(&gene);
+            line.push('\n');
+            writer.write(line.as_bytes())?;
         }
     }
 }
@@ -316,8 +323,8 @@ mod tests {
             .join("\n")
     }
 
-    // #[test]
-    fn test1() {
+    #[test]
+    fn test_mixed_chromosomes() {
         let queries = to_str(&[
             "chr1  10  50",
             "chr1  100 150",
@@ -368,14 +375,23 @@ mod tests {
     }
 
     #[test]
-    fn test2() {
-        let queries = to_str(&["chr1	11144641	11144761", "chr1	11144947	11145067"]);
+    fn test_mixed_gtf_regions() {
+        // This one is tricky because the third BED region overlaps 1st, 2nd and 4th GTF regions, but not the 3rd one.
+        let queries = to_str(&[
+            "chr1	11139594	11139714",
+            "chr1	11144641	11144761",
+            "chr1	11144947	11145067",
+        ]);
         let targets = &[
-            "chr1\tHAVANA\texon\t11144667\t11144886\t.\t+\t.\tgene_id \"ENSG00000225602.5\"; transcript_id \"ENST00000445982.5\"; gene_type \"lncRNA\"; gene_name \"MTOR-AS1\"; transcript_type \"lncRNA\"; transcript_name \"MTOR-AS1-202\"; exon_number 2; exon_id \"ENSE00001736483.1\"; level 2; transcript_support_level \"5\"; hgnc_id \"HGNC:40242\"; tag \"dotter_confirmed\"; tag \"basic\"; tag \"Ensembl_canonical\"; havana_gene \"OTTHUMG00000002003.1\"; havana_transcript \"OTTHUMT00000005565.1\";"
+            "chr1\tHAVANA\tgene\t11143898\t11149537\t.\t+\t.\tgene_id \"ENSG00000225602.5\"; gene_type \"lncRNA\"; gene_name \"MTOR-AS1\"; level 2; hgnc_id \"HGNC:40242\"; havana_gene \"OTTHUMG00000002003.1\";",
+            "chr1\tHAVANA\ttranscript\t11143898\t11149537\t.\t+\t.\tgene_id \"ENSG00000225602.5\"; transcript_id \"ENST00000445982.5\"; gene_type \"lncRNA\"; gene_name \"MTOR-AS1\"; transcript_type \"lncRNA\"; transcript_name \"MTOR-AS1-202\"; level 2; transcript_support_level \"5\"; hgnc_id \"HGNC:40242\"; tag \"dotter_confirmed\"; tag \"basic\"; tag \"Ensembl_canonical\"; havana_gene \"OTTHUMG00000002003.1\"; havana_transcript \"OTTHUMT00000005565.1\";",
+            "chr1\tHAVANA\texon\t11143898\t11143987\t.\t+\t.\tgene_id \"ENSG00000225602.5\"; transcript_id \"ENST00000445982.5\"; gene_type \"lncRNA\"; gene_name \"MTOR-AS1\"; transcript_type \"lncRNA\"; transcript_name \"MTOR-AS1-202\"; exon_number 1; exon_id \"ENSE00001591967.1\"; level 2; transcript_support_level \"5\"; hgnc_id \"HGNC:40242\"; tag \"dotter_confirmed\"; tag \"basic\"; tag \"Ensembl_canonical\"; havana_gene \"OTTHUMG00000002003.1\"; havana_transcript \"OTTHUMT00000005565.1\";",
+            "chr1\tHAVANA\texon\t11144667\t11144886\t.\t+\t.\tgene_id \"ENSG00000225602.5\"; transcript_id \"ENST00000445982.5\"; gene_type \"lncRNA\"; gene_name \"MTOR-AS1\"; transcript_type \"lncRNA\"; transcript_name \"MTOR-AS1-202\"; exon_number 2; exon_id \"ENSE00001736483.1\"; level 2; transcript_support_level \"5\"; hgnc_id \"HGNC:40242\"; tag \"dotter_confirmed\"; tag \"basic\"; tag \"Ensembl_canonical\"; havana_gene \"OTTHUMG00000002003.1\"; havana_transcript \"OTTHUMT00000005565.1\";",
         ].join("\n");
         let expected = to_str(&[
-            "chr1	11144641	11144761	MTOR-AS1",
-            "chr1	11144947	11145067	.",
+            "chr1	11139594	11139714    .",        //
+            "chr1	11144641	11144761    MTOR-AS1", // 11143897-11149537, 11143897-11149537, *, 11144666-11144886
+            "chr1	11144947	11145067    MTOR-AS1", // 11143897-11149537, 11143897-11149537, *, *
         ]);
         let mut output = vec![];
 
